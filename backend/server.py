@@ -3,6 +3,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from network_discovery import NetworkDiscovery
+from blockchain_service import block_from_row, chain_status, transactions
 
 try:
     import websocket
@@ -13,7 +15,7 @@ try:
 except Exception:
     websockets = None
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 HOST = os.getenv("NARAZ_HOST", "0.0.0.0")
 PORT = int(os.getenv("NARAZ_PORT", "8080"))
 WS_PORT = int(os.getenv("NARAZ_WS_PORT", str(PORT + 1)))
@@ -33,6 +35,7 @@ MARKET = {
 MARKET_LOCK = threading.RLock()
 WS_CLIENTS = set()
 WS_LOOP = None
+DISCOVERY = NetworkDiscovery(PORT, WS_PORT, HOST)
 
 def db():
     c = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
@@ -144,7 +147,7 @@ def seed_demo(c):
                     ("demo","demo@naraz.local",password_hash("demo12345"),wallet,now())).lastrowid
     for asset, quantity in (("USDT",10000),("BTC",0),("ETH",0),("BNB",0),("SOL",0)):
         c.execute("INSERT INTO holdings VALUES(?,?,?,?)",(uid,asset,quantity,1 if asset=="USDT" else 0))
-    t = make_tx("TESTNET_FAUCET",wallet,DEMO_GRANT)
+    t = make_tx("NARAZ_NETWORK",wallet,DEMO_GRANT)
     c.execute("INSERT INTO pending(tx_id,sender,recipient,amount,timestamp) VALUES(?,?,?,?,?)",
               (t["id"],t["sender"],t["recipient"],t["amount"],t["timestamp"]))
     mine_pending(c); c.commit()
@@ -186,6 +189,23 @@ def market_book(base):
         return book
     except Exception:
         with MARKET_LOCK: return MARKET["books"].get(base,{"symbol":base,"bids":[],"asks":[]})
+
+def market_candles(base, limit=120):
+    base=base.upper(); limit=max(20,min(int(limit),500))
+    if base not in BASES: return []
+    try:
+        req=Request(f"https://api.binance.com/api/v3/klines?symbol={base}USDT&interval=1m&limit={limit}",
+                   headers={"User-Agent":"NARaz/1.5"})
+        data=json.loads(urlopen(req,timeout=8).read().decode())
+        out=[]
+        for k in data:
+            out.append({"time":k[0],"open":float(k[1]),"high":float(k[2]),"low":float(k[3]),
+                        "close":float(k[4]),"volume":float(k[5]),"closed":True})
+        with MARKET_LOCK:
+            MARKET["candles"][base]=deque(out,maxlen=120)
+        return out
+    except Exception:
+        with MARKET_LOCK: return list(MARKET["candles"].get(base,[]))
 
 def normalize_book(base,data):
     return {"symbol":base,"bids":[[float(p),float(q)] for p,q in data.get("bids",[])],
@@ -312,11 +332,15 @@ class Handler(BaseHTTPRequestHandler):
         c=db(); path=urlparse(self.path).path
         try:
             if path=="/api/health": return self.send_json({"ok":True,"service":"NARaz Network","version":VERSION})
+            if path=="/api/network/nodes":
+                return self.send_json({"ok":True,"node_id":DISCOVERY.node_id,"nodes":DISCOVERY.snapshot(),
+                    "discovery_port":39555,"started_at":DISCOVERY.started_at})
             if path=="/api/network":
                 return self.send_json({"ok":True,"network":"NARaz Network","version":VERSION,
                     "chain":{"height":c.execute("SELECT COALESCE(MAX(idx),0) n FROM blocks").fetchone()["n"],"valid":chain_valid(c)},
                     "market":{"connected":MARKET["connected"],"source":MARKET["source"],
-                              "updated_at":MARKET["updated_at"]},"http_port":PORT,"websocket_port":WS_PORT,"pairs":PAIRS})
+                              "updated_at":MARKET["updated_at"]},"http_port":PORT,"websocket_port":WS_PORT,
+                    "discovery_port":39555,"node_id":DISCOVERY.node_id,"nodes":len(DISCOVERY.snapshot()),"pairs":PAIRS})
             if path=="/api/market":
                 if not MARKET["items"]: market_rest()
                 with MARKET_LOCK: return self.send_json({"ok":True,"items":list(MARKET["items"].values()),
@@ -329,6 +353,9 @@ class Handler(BaseHTTPRequestHandler):
                     losers=list(reversed(gainers))
                     return self.send_json({"ok":True,"items":items,"gainers":gainers[:3],"losers":losers[:3],
                         "updated_at":MARKET["updated_at"],"stream_connected":MARKET["connected"]})
+            if path.startswith("/api/market/candles/"):
+                base=path.rsplit("/",1)[-1].upper()
+                return self.send_json({"ok":True,"symbol":base,"interval":"1m","candles":market_candles(base)})
             if path.startswith("/api/market/history/"):
                 base=path.rsplit("/",1)[-1].upper()
                 with MARKET_LOCK: data=list(MARKET["history"].get(base,[]))
@@ -339,6 +366,20 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/trades/"):
                 base=path.rsplit("/",1)[-1].upper()
                 with MARKET_LOCK: return self.send_json({"ok":True,"trades":list(MARKET["trades"].get(base,[]))})
+            if path=="/api/chain/transactions":
+                return self.send_json({"ok":True,"transactions":transactions(c,200)})
+            if path.startswith("/api/chain/block/"):
+                try: idx=int(path.rsplit("/",1)[-1])
+                except ValueError: return self.send_json({"ok":False,"error":"INVALID_BLOCK"},400)
+                r=c.execute("SELECT * FROM blocks WHERE idx=?",(idx,)).fetchone()
+                if not r: return self.send_json({"ok":False,"error":"BLOCK_NOT_FOUND"},404)
+                return self.send_json({"ok":True,"block":{"index":r["idx"],"timestamp":r["timestamp"],
+                    "transactions":json.loads(r["transactions"]),"previous_hash":r["previous_hash"],"nonce":r["nonce"],"hash":r["hash"]}})
+            if path=="/api/chain/validate":
+                return self.send_json({"ok":True,"valid":chain_valid(c),"height":c.execute("SELECT COALESCE(MAX(idx),0) n FROM blocks").fetchone()["n"]})
+            if path=="/api/chain/status":
+                status=chain_status(c,chain_valid); status.update({"network":"NARaz Blockchain","max_supply":MAX_SUPPLY,"native_asset":"NARaz"})
+                return self.send_json({"ok":True,**status})
             if path=="/api/chain":
                 rows=c.execute("SELECT * FROM blocks ORDER BY idx DESC LIMIT 50").fetchall()
                 return self.send_json({"ok":True,"valid":chain_valid(c),
@@ -377,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
                 uid=c.execute("INSERT INTO users(username,email,password_hash,wallet,created_at) VALUES(?,?,?,?,?)",
                               (username,email,password_hash(password),wallet,now())).lastrowid
                 c.execute("INSERT INTO holdings VALUES(?,?,?,?)",(uid,"USDT",10000.0,1.0))
-                grant=make_tx("TESTNET_FAUCET",wallet,DEMO_GRANT)
+                grant=make_tx("NARAZ_NETWORK",wallet,DEMO_GRANT)
                 c.execute("INSERT INTO pending(tx_id,sender,recipient,amount,timestamp) VALUES(?,?,?,?,?)",
                           (grant["id"],grant["sender"],grant["recipient"],grant["amount"],grant["timestamp"]))
                 mine_pending(c)
@@ -396,7 +437,9 @@ class Handler(BaseHTTPRequestHandler):
                 u=auth(c,self.headers)
                 if not u: return self.send_json({"ok":False,"error":"AUTH_REQUIRED"},401)
                 amount=min(float(data.get("amount",1000)),10000)
-                grant=make_tx("TESTNET_FAUCET",u["wallet"],amount)
+                if amount<=0 or nar_balance(c,"NARAZ_NETWORK")+1e-12<amount:
+                    return self.send_json({"ok":False,"error":"FAUCET_EXHAUSTED"},400)
+                grant=make_tx("NARAZ_NETWORK",u["wallet"],amount)
                 c.execute("INSERT INTO pending(tx_id,sender,recipient,amount,timestamp) VALUES(?,?,?,?,?)",(grant["id"],grant["sender"],grant["recipient"],grant["amount"],grant["timestamp"]))
                 block=mine_pending(c); return self.send_json({"ok":True,"transaction":grant,"block":block})
             if path=="/api/transfer":
@@ -476,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db(); c=db(); seed_demo(c); c.close()
-    market_rest(); start_market(); start_ws()
+    market_rest(); start_market(); start_ws(); DISCOVERY.start()
     print(f"NARaz Network v{VERSION}: HTTP {PORT}, WS {WS_PORT}")
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
 
