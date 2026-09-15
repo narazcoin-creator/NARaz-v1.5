@@ -8,6 +8,7 @@ import android.webkit.WebViewClient;
 
 public class MainActivity extends Activity {
     private WebView web;
+    private NetworkDiscovery discovery;
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         web = new WebView(this);
@@ -21,7 +22,10 @@ public class MainActivity extends Activity {
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         web.setWebViewClient(new WebViewClient());
         web.loadUrl("file:///android_asset/index.html");
+        discovery = new NetworkDiscovery(web);
+        discovery.start();
     }
+    @Override protected void onDestroy() { if (discovery != null) discovery.stop(); super.onDestroy(); }
     @Override public void onBackPressed() {
         if (web.canGoBack()) web.goBack(); else super.onBackPressed();
     }
